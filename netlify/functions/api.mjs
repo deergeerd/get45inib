@@ -12,7 +12,7 @@ const msgs = () => store("messages"); //  msg/<chatId>/<ts>-<rand>
 const json = (data, status = 200, headers = {}) =>
   new Response(JSON.stringify(data), {
     status,
-    headers: { "Content-Type": "application/json", ...headers },
+    headers: { "Content-Type": "application/json", "Cache-Control": "no-store", ...headers },
   });
 const fail = (status, error) => json({ error }, status);
 
@@ -98,6 +98,10 @@ async function touchIndex(chat, last, preview) {
       index().setJSON(`idx/${m}/${chat.id}`, { chatId: chat.id, last, preview })
     )
   );
+  // Bump each member's version only AFTER the data is written, so a client that
+  // sees the new version is guaranteed to find the new data.
+  const v = `${Date.now()}-${rand(2)}`; // unique per change; clients only compare for equality
+  await Promise.all(chat.members.map((m) => index().setJSON(`ver/${m}`, v)));
 }
 
 // ---------- routes ----------
@@ -130,7 +134,7 @@ async function searchUsers(me, url) {
   return json({ users: found });
 }
 
-async function listChats(me) {
+async function chatsFor(me) {
   const { blobs } = await index().list({ prefix: `idx/${me}/` });
   const rows = await Promise.all(
     blobs.map(async (b) => {
@@ -139,8 +143,11 @@ async function listChats(me) {
       return chat ? { ...chat, last: idx.last, preview: idx.preview } : null;
     })
   );
-  const list = rows.filter(Boolean).sort((a, b) => (b.last || 0) - (a.last || 0));
-  return json({ chats: list });
+  return rows.filter(Boolean).sort((a, b) => (b.last || 0) - (a.last || 0));
+}
+
+async function listChats(me) {
+  return json({ chats: await chatsFor(me) });
 }
 
 async function createChat(me, req) {
@@ -180,16 +187,37 @@ async function createChat(me, req) {
   return fail(400, "Unknown chat type.");
 }
 
-async function getMessages(me, id, url) {
+async function messagesFor(me, id, after) {
   const chat = await loadChatFor(id, me);
-  if (!chat) return fail(404, "Chat not found.");
-  const after = url.searchParams.get("after");
+  if (!chat) return null;
   const { blobs } = await msgs().list({ prefix: `msg/${id}/` });
   let keys = blobs.map((b) => b.key).sort();
   keys = after ? keys.filter((k) => k > after) : keys.slice(-50);
   const rows = await Promise.all(keys.map((k) => msgs().get(k, { type: "json" })));
-  const messages = rows.map((m, i) => (m ? { key: keys[i], ...m } : null)).filter(Boolean);
-  return json({ messages });
+  return rows.map((m, i) => (m ? { key: keys[i], ...m } : null)).filter(Boolean);
+}
+
+async function getMessages(me, id, url) {
+  const messages = await messagesFor(me, id, url.searchParams.get("after"));
+  return messages ? json({ messages }) : fail(404, "Chat not found.");
+}
+
+// One cheap endpoint for the client to poll. If the user's version hasn't changed
+// it answers 204 with no body, after a single blob read.
+async function sync(me, url) {
+  const clientV = url.searchParams.get("v") || "";
+  // Read the version BEFORE the data: if something changes mid-read, the next poll sees a newer version.
+  const v = (await index().get(`ver/${me}`, { type: "json" })) || "0";
+  if (clientV && clientV === v) {
+    return new Response(null, { status: 204, headers: { "Cache-Control": "no-store" } });
+  }
+  const out = { v, chats: await chatsFor(me) };
+  const chatId = url.searchParams.get("chat");
+  if (chatId && /^[\w-]+$/.test(chatId)) {
+    const messages = await messagesFor(me, chatId, url.searchParams.get("after"));
+    if (messages) out.messages = messages;
+  }
+  return json(out);
 }
 
 async function sendMessage(me, id, req) {
@@ -221,6 +249,7 @@ export default async (req) => {
     if (!session) return fail(401, "Not signed in.");
     const me = session.u;
 
+    if (method === "GET" && path === "/sync") return await sync(me, url);
     if (method === "GET" && path === "/me") return json({ username: me });
     if (method === "GET" && path === "/users") return await searchUsers(me, url);
     if (method === "GET" && path === "/chats") return await listChats(me);
