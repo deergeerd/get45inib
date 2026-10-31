@@ -138,7 +138,8 @@
 
 <script>
 const $ = (id) => document.getElementById(id);
-const state = { me: null, chats: [], active: null, lastKey: null, seen: new Set(), mode: "login", pollTimer: null, listTimer: null };
+const state = { me: null, chats: [], active: null, lastKey: null, seen: new Set(), mode: "login",
+  version: "", idle: 0, syncing: null, again: false, timer: null };
 
 async function api(path, opts = {}) {
   const res = await fetch("/api" + path, {
@@ -196,7 +197,6 @@ function startApp(username) {
   $("auth").classList.add("hidden");
   $("app").classList.remove("hidden");
   closeChat();
-  refreshChats();
   startPolling();
 }
 
@@ -205,13 +205,7 @@ function chatLabel(c) {
   return "@" + c.members.find((m) => m !== state.me);
 }
 
-async function refreshChats() {
-  try {
-    const { chats } = await api("/chats");
-    state.chats = chats;
-    renderChatList();
-  } catch (e) { handleAuthError(e); }
-}
+async function refreshChats() { await sync(true); }
 
 function renderChatList() {
   const box = $("chatList");
@@ -254,7 +248,7 @@ function openChat(c) {
   $("composer").classList.remove("hidden");
   $("messages").textContent = "";
   renderChatList();
-  loadMessages(true);
+  poke();
   $("text").focus();
 }
 
@@ -307,24 +301,53 @@ function appendMessages(list) {
   if (added && (nearBottom || list[list.length - 1].from === state.me)) box.scrollTop = box.scrollHeight;
 }
 
-async function loadMessages(initial = false) {
+function applyMessages(messages, wasInitial) {
+  if (messages.length) {
+    $("noMsgs")?.remove();
+    appendMessages(messages);
+    if (wasInitial) $("messages").scrollTop = $("messages").scrollHeight;
+  } else if (wasInitial && !$("noMsgs")) {
+    const p = document.createElement("div");
+    p.className = "placeholder";
+    p.id = "noMsgs";
+    p.textContent = "No messages yet. Say hi!";
+    $("messages").appendChild(p);
+  }
+}
+
+/* One request does it all: chat list + new messages for the open chat.
+   When nothing changed the server answers 204 with no body. */
+async function runSync(force) {
   const chat = state.active;
-  if (!chat) return;
+  const wasInitial = !state.lastKey;
   try {
-    const q = state.lastKey ? "?after=" + encodeURIComponent(state.lastKey) : "";
-    const { messages } = await api(`/chats/${encodeURIComponent(chat.id)}/messages${q}`);
-    if (state.active !== chat) return; // switched chats mid-request
-    if (messages.length) appendMessages(messages);
-    else if (initial) {
-      const p = document.createElement("div");
-      p.className = "placeholder";
-      p.id = "noMsgs";
-      p.textContent = "No messages yet. Say hi!";
-      $("messages").appendChild(p);
+    const p = new URLSearchParams();
+    if (!force && state.version) p.set("v", state.version);
+    if (chat) {
+      p.set("chat", chat.id);
+      if (state.lastKey) p.set("after", state.lastKey);
     }
-    if (messages.length) $("noMsgs")?.remove();
-    if (initial && messages.length) $("messages").scrollTop = $("messages").scrollHeight;
-  } catch (e) { handleAuthError(e); }
+    const res = await fetch("/api/sync?" + p, { credentials: "same-origin", cache: "no-store" });
+    if (res.status === 204) { state.idle++; return; }
+    if (res.status === 401) { handleAuthError({ status: 401 }); return; }
+    if (!res.ok) return;
+    const d = await res.json();
+    state.version = d.v;
+    state.idle = 0;
+    state.chats = d.chats;
+    renderChatList();
+    if (d.messages && state.active === chat) applyMessages(d.messages, wasInitial);
+  } catch { /* network hiccup: try again on the next tick */ }
+}
+
+function sync(force = false) {
+  if (!state.me) return Promise.resolve();
+  if (state.syncing) { state.again = state.again || force; return state.syncing; }
+  state.syncing = runSync(force).finally(() => {
+    state.syncing = null;
+    if (state.again) { state.again = false; sync(true); }
+  });
+  return state.syncing;
 }
 
 $("composer").onsubmit = async (e) => {
@@ -335,8 +358,7 @@ $("composer").onsubmit = async (e) => {
   input.value = "";
   try {
     await api(`/chats/${encodeURIComponent(state.active.id)}/messages`, { method: "POST", body: { text } });
-    await loadMessages();
-    refreshChats();
+    poke();
   } catch (err) { input.value = text; alert(err.message); }
 };
 
@@ -351,22 +373,26 @@ function handleAuthError(e) {
 }
 
 /* ---------- polling (fast when visible, slow when hidden) ---------- */
-function startPolling() {
-  stopPolling();
-  const tick = async () => {
-    if (!state.me) return;
-    if (state.active) await loadMessages();
-    state.pollTimer = setTimeout(tick, document.hidden ? 15000 : 2000);
-  };
-  const listTick = async () => {
-    if (!state.me) return;
-    await refreshChats();
-    state.listTimer = setTimeout(listTick, document.hidden ? 30000 : 6000);
-  };
-  state.pollTimer = setTimeout(tick, 2000);
-  state.listTimer = setTimeout(listTick, 6000);
+// Fast (2s) right after activity, backing off to 10s when nothing is happening, 30s in a hidden tab.
+function nextDelay() {
+  if (document.hidden) return 30000;
+  return Math.min(2000 * 2 ** Math.floor(state.idle / 5), 10000);
 }
-function stopPolling() { clearTimeout(state.pollTimer); clearTimeout(state.listTimer); }
+function schedule() {
+  clearTimeout(state.timer);
+  if (!state.me) return;
+  state.timer = setTimeout(async () => { await sync(); schedule(); }, nextDelay());
+}
+// Sync right now (forced) and go back to the fast polling rate.
+function poke() {
+  state.idle = 0;
+  sync(true);
+  schedule();
+}
+function startPolling() { state.version = ""; poke(); }
+function stopPolling() { clearTimeout(state.timer); state.version = ""; }
+document.addEventListener("visibilitychange", () => { if (!document.hidden && state.me) poke(); });
+$("text").addEventListener("input", () => { state.idle = 0; });
 
 /* ---------- modals ---------- */
 function openModal(build) {
