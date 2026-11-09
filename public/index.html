@@ -53,7 +53,12 @@
   .chat-row:hover { background: var(--bg); }
   .chat-row.active { background: var(--theirs); }
   .chat-row .name { font-weight: 600; display: flex; gap: 6px; align-items: center; }
-  .chat-row .tag { font-size: 11px; font-weight: 500; color: var(--muted); border: 1px solid var(--line); border-radius: 10px; padding: 0 6px; }
+  .sys { align-self: center; max-width: 85%; text-align: center; color: var(--muted); font-size: 12px; margin: 4px 0; }
+  .btn.danger { background: #c0392b; color: #fff; }
+  .main-head .sub.typing { color: var(--accent); font-weight: 600; }
+  .modal h3 { margin: 16px 0 6px; font-size: 14px; }
+  .modal .sub-note { color: var(--muted); font-size: 13px; margin-bottom: 8px; }
+  .chat-row .tag, .modal .tag { font-size: 11px; font-weight: 500; color: var(--muted); border: 1px solid var(--line); border-radius: 10px; padding: 0 6px; }
   .chat-row .prev { color: var(--muted); font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .chat-row.unread .prev { color: var(--ink); font-weight: 600; }
   .badge { margin-left: auto; min-width: 20px; padding: 0 7px; border-radius: 10px; background: var(--accent); color: var(--accent-ink); font-size: 12px; font-weight: 700; text-align: center; line-height: 20px; }
@@ -71,6 +76,7 @@
   .msg .time { font-size: 11px; opacity: .65; margin-top: 2px; display: flex; justify-content: flex-end; gap: 10px; }
   .msg .del { background: none; border: 0; padding: 0; color: inherit; font-size: 11px; text-decoration: underline; }
   .msg.deleted { font-style: italic; opacity: .6; }
+  .day { align-self: center; margin: 12px 0 6px; padding: 3px 12px; border-radius: 10px; background: var(--theirs); color: var(--muted); font-size: 12px; font-weight: 600; }
   .placeholder { margin: auto; color: var(--muted); }
   form#composer { display: flex; gap: 8px; padding: 12px; background: var(--panel); border-top: 1px solid var(--line); }
   form#composer input { flex: 1; }
@@ -129,6 +135,7 @@
         <div class="title" id="chatTitle">Select a chat</div>
         <div class="sub" id="chatSub"></div>
       </div>
+      <button class="btn ghost hidden" id="infoBtn" style="margin-left:auto;padding:6px 12px">Members</button>
     </div>
     <div id="messages"><div class="placeholder">Pick a chat or start a new one.</div></div>
     <form id="composer" class="hidden">
@@ -143,7 +150,7 @@
 <script>
 const $ = (id) => document.getElementById(id);
 const state = { me: null, chats: [], active: null, lastKey: null, seen: new Set(), els: new Map(), mode: "login",
-  maxTs: 0, readSent: new Map(),
+  maxTs: 0, readSent: new Map(), lastDay: "", epoch: 0, typing: [], typingSig: "", lastPing: 0,
   version: "", idle: 0, syncing: null, again: false, timer: null };
 
 async function api(path, opts = {}) {
@@ -260,13 +267,40 @@ function renderChatList() {
   }
 }
 
+function updateHeader() {
+  const c = state.active;
+  if (!c) return;
+  $("chatTitle").textContent = chatLabel(c);
+  const t = state.typing;
+  let sub;
+  if (t.length) {
+    if (c.type !== "group") sub = "typing…";
+    else if (t.length === 1) sub = `${t[0]} is typing…`;
+    else if (t.length === 2) sub = `${t[0]} and ${t[1]} are typing…`;
+    else sub = `${t.length} people are typing…`;
+  } else {
+    sub = c.type === "group" ? c.members.join(", ") : "Direct message";
+  }
+  $("chatSub").textContent = sub;
+  $("chatSub").classList.toggle("typing", t.length > 0);
+}
+
+// What the server says about who is typing in the open chat.
+function showTyping(list) {
+  state.typing = list;
+  state.typingSig = list.join(",");
+  updateHeader();
+  if (list.length) state.idle = 0; // stay on the fast poll while someone is typing
+}
+
 function openChat(c) {
   state.active = c;
   state.lastKey = null;
-  state.seen = new Set(); state.els = new Map(); state.maxTs = 0;
+  state.seen = new Set(); state.els = new Map(); state.maxTs = 0; state.lastDay = "";
+  state.typing = []; state.typingSig = ""; state.lastPing = 0;
   $("app").classList.add("in-chat");
-  $("chatTitle").textContent = chatLabel(c);
-  $("chatSub").textContent = c.type === "group" ? c.members.join(", ") : "Direct message";
+  updateHeader();
+  $("infoBtn").classList.toggle("hidden", c.type !== "group");
   $("composer").classList.remove("hidden");
   $("messages").textContent = "";
   renderChatList();
@@ -274,24 +308,43 @@ function openChat(c) {
   $("text").focus();
 }
 
-function closeChat() {
+function closeChat(notice) {
   state.active = null;
   state.lastKey = null;
-  state.seen = new Set(); state.els = new Map(); state.maxTs = 0;
+  state.seen = new Set(); state.els = new Map(); state.maxTs = 0; state.lastDay = "";
+  state.typing = []; state.typingSig = ""; state.lastPing = 0;
   $("app").classList.remove("in-chat");
   $("chatTitle").textContent = "Select a chat";
   $("chatSub").textContent = "";
+  $("infoBtn").classList.add("hidden");
   $("composer").classList.add("hidden");
   const p = document.createElement("div");
   p.className = "placeholder";
-  p.textContent = "Pick a chat or start a new one.";
+  p.textContent = typeof notice === "string" ? notice : "Pick a chat or start a new one.";
   $("messages").replaceChildren(p);
   renderChatList();
 }
-$("backBtn").onclick = closeChat;
+$("backBtn").onclick = () => closeChat();
 
 function fmtTime(ts) {
   return new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+const dayKey = (ts) => { const d = new Date(ts); return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`; };
+
+function dayLabel(ts) {
+  const d = new Date(ts);
+  const startOf = (x) => new Date(x.getFullYear(), x.getMonth(), x.getDate());
+  const diff = Math.round((startOf(new Date()) - startOf(d)) / 86400000);
+  if (diff === 0) return "Today";
+  if (diff === 1) return "Yesterday";
+  if (diff > 1 && diff < 7) return d.toLocaleDateString([], { weekday: "long" });
+  return d.toLocaleDateString([], { day: "numeric", month: "long", year: "numeric" });
+}
+
+// "Today" must not go stale if the tab stays open past midnight.
+function refreshDayLabels() {
+  for (const el of document.querySelectorAll("#messages .day")) el.textContent = dayLabel(Number(el.dataset.ts));
 }
 
 function appendMessages(list) {
@@ -303,6 +356,24 @@ function appendMessages(list) {
     if (state.seen.has(m.key)) continue;
     state.seen.add(m.key);
     added++;
+    const day = dayKey(m.ts);
+    if (day !== state.lastDay) {
+      const sep = document.createElement("div");
+      sep.className = "day";
+      sep.dataset.ts = String(m.ts);
+      sep.textContent = dayLabel(m.ts);
+      box.appendChild(sep);
+      state.lastDay = day;
+    }
+    if (m.system) { // "alice added dave": a centered notice, not a bubble
+      const s = document.createElement("div");
+      s.className = "sys";
+      s.textContent = m.text;
+      box.appendChild(s);
+      if (!state.lastKey || m.key > state.lastKey) state.lastKey = m.key;
+      if (m.ts > state.maxTs) state.maxTs = m.ts;
+      continue;
+    }
     const div = document.createElement("div");
     div.className = "msg" + (m.from === state.me ? " mine" : "");
     if (state.active.type === "group" && m.from !== state.me) {
@@ -334,7 +405,33 @@ function appendMessages(list) {
     if (!state.lastKey || m.key > state.lastKey) state.lastKey = m.key;
     if (m.ts > state.maxTs) state.maxTs = m.ts;
   }
+  if (added) refreshDayLabels();
   if (added && (nearBottom || list[list.length - 1].from === state.me)) box.scrollTop = box.scrollHeight;
+}
+
+// Keep the open chat in step with the server: membership changes, or being removed.
+async function reconcileActive(chat, epoch) {
+  if (!chat || state.active !== chat) return;
+  const found = state.chats.find((c) => c.id === chat.id);
+  if (found) {
+    // `epoch` changes whenever we edit membership ourselves; a response that was already in flight
+    // then predates our edit and must not overwrite it (the follow-up sync will carry the new state).
+    if (epoch !== state.epoch) return;
+    if (found.members.join(",") !== chat.members.join(",") || found.owner !== chat.owner) {
+      Object.assign(chat, found); // mutate, so references to the open chat stay valid
+      updateHeader();
+    }
+    return;
+  }
+  // Missing from the list: ask the server before closing, so one stale response can't kick anyone out.
+  const gone = await fetch(`/api/chats/${encodeURIComponent(chat.id)}/messages?after=~`, { credentials: "same-origin", cache: "no-store" })
+    .then((r) => r.status === 404).catch(() => false);
+  if (gone && state.active === chat) {
+    const name = chatLabel(chat);
+    state.chats = state.chats.filter((c) => c.id !== chat.id);
+    $("modalRoot").textContent = "";
+    closeChat(`You're no longer in ${name}.`);
+  }
 }
 
 // Tell the server how far we've read, but only while the tab is actually visible.
@@ -390,12 +487,14 @@ function applyMessages(messages, wasInitial) {
    When nothing changed the server answers 204 with no body. */
 async function runSync(force) {
   const chat = state.active;
+  const epoch = state.epoch;
   const wasInitial = !state.lastKey;
   try {
     const p = new URLSearchParams();
     if (!force && state.version) p.set("v", state.version);
     if (chat) {
       p.set("chat", chat.id);
+      p.set("t", state.typingSig);
       if (state.lastKey) p.set("after", state.lastKey);
     }
     const res = await fetch("/api/sync?" + p, { credentials: "same-origin", cache: "no-store" });
@@ -404,14 +503,18 @@ async function runSync(force) {
     if (!res.ok) return;
     const d = await res.json();
     state.version = d.v;
-    state.idle = 0;
-    state.chats = d.chats;
-    renderChatList();
-    if (d.messages && state.active === chat) {
-      applyMessages(d.messages, wasInitial);
-      if (d.deleted) applyDeleted(d.deleted);
-      markRead();
+    if (d.chats) { // absent when only the typing state changed
+      state.idle = 0;
+      state.chats = d.chats;
+      renderChatList();
+      await reconcileActive(chat, epoch);
+      if (d.messages && state.active === chat) {
+        applyMessages(d.messages, wasInitial);
+        if (d.deleted) applyDeleted(d.deleted);
+        markRead();
+      }
     }
+    if (d.typing && state.active === chat) showTyping(d.typing);
   } catch { /* network hiccup: try again on the next tick */ }
 }
 
@@ -431,6 +534,7 @@ $("composer").onsubmit = async (e) => {
   const text = input.value.trim();
   if (!text || !state.active) return;
   input.value = "";
+  state.lastPing = 0; // sending ends "typing" on the server; the next keystroke starts a new ping
   try {
     await api(`/chats/${encodeURIComponent(state.active.id)}/messages`, { method: "POST", body: { text } });
     poke();
@@ -451,7 +555,9 @@ function handleAuthError(e) {
 // Fast (2s) right after activity, backing off to 10s when nothing is happening, 30s in a hidden tab.
 function nextDelay() {
   if (document.hidden) return 30000;
-  return Math.min(2000 * 2 ** Math.floor(state.idle / 5), 10000);
+  // With a chat open, don't back off past 4s: otherwise "typing…" would show up many seconds late.
+  const cap = state.active ? 4000 : 10000;
+  return Math.min(2000 * 2 ** Math.floor(state.idle / 5), cap);
 }
 function schedule() {
   clearTimeout(state.timer);
@@ -469,9 +575,23 @@ function stopPolling() { clearTimeout(state.timer); state.version = ""; }
 document.addEventListener("visibilitychange", () => {
   if (!state.me) return;
   renderChatList();
-  if (!document.hidden) { markRead(); poke(); }
+  if (!document.hidden) { refreshDayLabels(); markRead(); poke(); }
 });
-$("text").addEventListener("input", () => { state.idle = 0; });
+// Tell the server I'm typing: at most one ping per 2.5s, and a "stopped" ping when the box is emptied.
+function sendTyping(chat, on) {
+  api(`/chats/${encodeURIComponent(chat.id)}/typing`, { method: "POST", body: { typing: on } }).catch(() => {});
+}
+$("text").addEventListener("input", () => {
+  state.idle = 0;
+  const chat = state.active;
+  if (!chat) return;
+  if (!$("text").value.trim()) {
+    if (state.lastPing) { state.lastPing = 0; sendTyping(chat, false); }
+    return;
+  }
+  const now = Date.now();
+  if (now - state.lastPing > 2500) { state.lastPing = now; sendTyping(chat, true); }
+});
 
 /* ---------- modals ---------- */
 function openModal(build) {
@@ -488,7 +608,7 @@ function openModal(build) {
   return close;
 }
 
-function userPicker(onPick, excluded = () => []) {
+function userPicker(onPick, excluded = () => [], label = "Select") {
   const wrap = document.createElement("div");
   const input = document.createElement("input");
   input.type = "text"; input.placeholder = "Search username"; input.autocapitalize = "none";
@@ -509,7 +629,7 @@ function userPicker(onPick, excluded = () => []) {
           const r = document.createElement("div");
           r.className = "result";
           const s = document.createElement("span"); s.textContent = "@" + u;
-          const b = document.createElement("button"); b.className = "btn"; b.type = "button"; b.style.padding = "4px 10px"; b.textContent = "Select";
+          const b = document.createElement("button"); b.className = "btn"; b.type = "button"; b.style.padding = "4px 10px"; b.textContent = label;
           b.onclick = () => onPick(u);
           r.append(s, b);
           results.appendChild(r);
@@ -571,6 +691,83 @@ $("newGroup").onclick = () => openModal((modal, close) => {
   modal.append(h, nameLabel, chips, picker.el, err, row);
   nameInput.focus();
 });
+
+/* ---------- group members ---------- */
+$("infoBtn").onclick = () => {
+  const chat = state.active;
+  if (!chat || chat.type !== "group") return;
+  openModal((modal, close) => {
+    const mk = (tag, cls, text) => {
+      const e = document.createElement(tag);
+      if (cls) e.className = cls;
+      if (text != null) e.textContent = text;
+      return e;
+    };
+    let error = "";
+    const base = `/chats/${encodeURIComponent(chat.id)}/members`;
+    const act = async (fn) => {
+      error = "";
+      try { await fn(); } catch (e) { error = e.message; }
+      render();
+    };
+    const applyChange = (r) => { state.epoch++; Object.assign(chat, r.chat); updateHeader(); poke(); };
+
+    const render = () => {
+      modal.textContent = "";
+      const isOwner = chat.owner === state.me;
+      modal.append(mk("h2", "", chat.name), mk("div", "sub-note", `${chat.members.length} members`));
+
+      const list = mk("div", "results");
+      for (const u of chat.members) {
+        const row = mk("div", "result");
+        const label = mk("span", "", "@" + u + (u === state.me ? " (you)" : ""));
+        if (u === chat.owner) label.append(" ", mk("span", "tag", "owner"));
+        row.appendChild(label);
+        if (isOwner && u !== state.me) {
+          const rm = mk("button", "btn ghost", "Remove");
+          rm.type = "button";
+          rm.style.padding = "4px 10px";
+          rm.onclick = () => {
+            if (!confirm(`Remove @${u} from the group?`)) return;
+            act(async () => applyChange(await api(`${base}/${u}`, { method: "DELETE" })));
+          };
+          row.appendChild(rm);
+        }
+        list.appendChild(row);
+      }
+      modal.appendChild(list);
+
+      modal.appendChild(mk("h3", "", "Add people"));
+      const picker = userPicker(
+        (u) => act(async () => applyChange(await api(base, { method: "POST", body: { add: [u] } }))),
+        () => chat.members,
+        "Add"
+      );
+      modal.appendChild(picker.el);
+      if (error) modal.appendChild(mk("div", "err", error));
+
+      const row = mk("div", "row");
+      const leave = mk("button", "btn danger", "Leave group");
+      leave.type = "button";
+      leave.onclick = () => {
+        if (!confirm("Leave this group?")) return;
+        act(async () => {
+          await api(`${base}/${state.me}`, { method: "DELETE" });
+          state.chats = state.chats.filter((c) => c.id !== chat.id);
+          close();
+          closeChat();
+          poke();
+        });
+      };
+      const done = mk("button", "btn ghost", "Close");
+      done.type = "button";
+      done.onclick = close;
+      row.append(leave, done);
+      modal.appendChild(row);
+    };
+    render();
+  });
+};
 
 /* ---------- boot ---------- */
 (async () => {
