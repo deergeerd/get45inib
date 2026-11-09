@@ -7,6 +7,7 @@ const users = () => store("users"); //  u/<username>
 const chats = () => store("chats"); //  c/<chatId>
 const index = () => store("chat-index"); //  idx/<username>/<chatId>
 const msgs = () => store("messages"); //  msg/<chatId>/<ts>-<rand>
+const rl = () => store("ratelimit"); //  login/u/<hash>, login/ip/<hash>, signup/ip/<hash>
 
 // ---------- helpers ----------
 const json = (data, status = 200, headers = {}) =>
@@ -18,6 +19,54 @@ const fail = (status, error) => json({ error }, status);
 
 const USERNAME_RE = /^[a-z0-9_]{3,20}$/;
 const SESSION_DAYS = 30;
+
+// ---------- rate limiting ----------
+const MIN = 60_000;
+const LOGIN_USER_MAX = 5; //  failed logins per username before it locks
+const LOGIN_IP_MAX = 20; //   failed logins per IP before it locks (covers guessing across many usernames)
+const LOGIN_WINDOW = 15 * MIN; // failures older than this are forgotten; also the lock duration
+const SIGNUP_IP_MAX = 10; //  signups per IP per hour
+const SIGNUP_WINDOW = 60 * MIN;
+
+const sha = (s) => crypto.createHash("sha256").update(s).digest("hex").slice(0, 32);
+
+// Hashed so we never store raw IPs. Returns null when the IP is unknown (e.g. local dev).
+function clientKey(req, kind) {
+  const ip =
+    req.headers.get("x-nf-client-connection-ip") ||
+    (req.headers.get("x-forwarded-for") || "").split(",")[0].trim();
+  return ip ? `${kind}/ip/${sha(ip)}` : null;
+}
+
+// Seconds left on the lock for this key (0 = not locked).
+async function lockedFor(key) {
+  const rec = await rl().get(key, { type: "json" });
+  return rec && rec.lockedUntil > Date.now() ? Math.ceil((rec.lockedUntil - Date.now()) / 1000) : 0;
+}
+
+// Record one event. If `max` events happen within `window`, lock the key for `lockMs`.
+// Returns true if the key is locked afterwards.
+async function recordHit(key, max, window, lockMs) {
+  const now = Date.now();
+  const rec = (await rl().get(key, { type: "json" })) || { hits: [], lockedUntil: 0 };
+  rec.hits = rec.hits.filter((t) => now - t < window);
+  rec.hits.push(now);
+  if (rec.hits.length >= max) {
+    rec.lockedUntil = now + lockMs;
+    rec.hits = [];
+  }
+  await rl().setJSON(key, rec);
+  return rec.lockedUntil > now;
+}
+
+function tooMany(seconds) {
+  const mins = Math.max(1, Math.ceil(seconds / 60));
+  return json(
+    { error: `Too many attempts. Try again in ${mins} minute${mins === 1 ? "" : "s"}.` },
+    429,
+    { "Retry-After": String(seconds) }
+  );
+}
 
 function secret() {
   const s = process.env.SESSION_SECRET;
@@ -92,20 +141,45 @@ async function loadChatFor(id, username) {
   return chat;
 }
 
-async function touchIndex(chat, last, preview) {
+// Each member has one index entry per chat: { chatId, last, preview, unread, readTs }.
+// `fn(member, current)` returns the member's new entry. Version is bumped after the writes.
+async function updateIndex(chat, fn) {
   await Promise.all(
-    chat.members.map((m) =>
-      index().setJSON(`idx/${m}/${chat.id}`, { chatId: chat.id, last, preview })
-    )
+    chat.members.map(async (m) => {
+      const key = `idx/${m}/${chat.id}`;
+      const cur = (await index().get(key, { type: "json" })) || { chatId: chat.id, last: 0, preview: "", unread: 0, readTs: 0 };
+      await index().setJSON(key, fn(m, cur));
+    })
   );
-  // Bump each member's version only AFTER the data is written, so a client that
-  // sees the new version is guaranteed to find the new data.
+  await bumpVersion(chat.members);
+}
+
+// New activity in a chat. If `from` is set, everyone except the sender gets +1 unread.
+// The sender's own count is deliberately left alone: a message from someone else may have
+// landed just before they hit send, and only the client knows what was actually displayed.
+// The sender's client clears it via /read right after its next sync.
+async function touchIndex(chat, last, preview, from = null) {
+  await updateIndex(chat, (m, cur) => {
+    if (!from || m === from) return { ...cur, last, preview };
+    return { ...cur, last, preview, unread: (cur.unread || 0) + 1 };
+  });
+}
+
+// Bump each member's version only AFTER the data is written, so a client that
+// sees the new version is guaranteed to find the new data.
+async function bumpVersion(members) {
   const v = `${Date.now()}-${rand(2)}`; // unique per change; clients only compare for equality
-  await Promise.all(chat.members.map((m) => index().setJSON(`ver/${m}`, v)));
+  await Promise.all(members.map((m) => index().setJSON(`ver/${m}`, v)));
 }
 
 // ---------- routes ----------
 async function signup(req) {
+  const ikey = clientKey(req, "signup");
+  if (ikey) {
+    const wait = await lockedFor(ikey);
+    if (wait) return tooMany(wait);
+    await recordHit(ikey, SIGNUP_IP_MAX, SIGNUP_WINDOW, SIGNUP_WINDOW);
+  }
   const { username, password } = await readBody(req);
   const name = String(username || "").toLowerCase();
   if (!USERNAME_RE.test(name)) return fail(400, "Username: 3-20 chars, a-z, 0-9, underscore.");
@@ -119,10 +193,23 @@ async function signup(req) {
 async function login(req) {
   const { username, password } = await readBody(req);
   const name = String(username || "").toLowerCase();
+  // Keyed by what was typed, whether or not the account exists, so attackers learn nothing.
+  const ukey = `login/u/${sha(name)}`;
+  const ikey = clientKey(req, "login");
+
+  // Check locks BEFORE touching the password: a locked account rejects even the right password,
+  // and we skip the expensive hash.
+  const wait = Math.max(await lockedFor(ukey), ikey ? await lockedFor(ikey) : 0);
+  if (wait) return tooMany(wait);
+
   const user = await users().get(`u/${name}`, { type: "json" });
   if (!user || typeof password !== "string" || !checkPassword(password, user)) {
+    const userLocked = await recordHit(ukey, LOGIN_USER_MAX, LOGIN_WINDOW, LOGIN_WINDOW);
+    const ipLocked = ikey ? await recordHit(ikey, LOGIN_IP_MAX, LOGIN_WINDOW, LOGIN_WINDOW) : false;
+    if (userLocked || ipLocked) return tooMany(Math.ceil(LOGIN_WINDOW / 1000));
     return fail(401, "Wrong username or password.");
   }
+  await rl().delete(ukey); // success clears this username's failures (the IP's count is kept on purpose)
   return json({ username: name }, 200, { "Set-Cookie": sessionCookie(name) });
 }
 
@@ -140,7 +227,7 @@ async function chatsFor(me) {
     blobs.map(async (b) => {
       const idx = await index().get(b.key, { type: "json" });
       const chat = idx && (await chats().get(`c/${idx.chatId}`, { type: "json" }));
-      return chat ? { ...chat, last: idx.last, preview: idx.preview } : null;
+      return chat ? { ...chat, last: idx.last, preview: idx.preview, unread: idx.unread || 0 } : null;
     })
   );
   return rows.filter(Boolean).sort((a, b) => (b.last || 0) - (a.last || 0));
@@ -215,7 +302,11 @@ async function sync(me, url) {
   const chatId = url.searchParams.get("chat");
   if (chatId && /^[\w-]+$/.test(chatId)) {
     const messages = await messagesFor(me, chatId, url.searchParams.get("after"));
-    if (messages) out.messages = messages;
+    if (messages) {
+      out.messages = messages;
+      const { blobs } = await msgs().list({ prefix: `del/${chatId}/` });
+      out.deleted = blobs.map((b) => b.key.split("/").pop()).sort().slice(-100);
+    }
   }
   return json(out);
 }
@@ -230,8 +321,52 @@ async function sendMessage(me, id, req) {
   const ts = Date.now();
   const key = `msg/${id}/${String(ts).padStart(13, "0")}-${rand(3)}`;
   await msgs().setJSON(key, { from: me, text: clean, ts });
-  await touchIndex(chat, ts, `${me}: ${clean.slice(0, 60)}`);
+  await touchIndex(chat, ts, `${me}: ${clean.slice(0, 60)}`, me);
   return json({ ok: true, key });
+}
+
+async function deleteMessage(me, id, suffix) {
+  const chat = await loadChatFor(id, me);
+  if (!chat) return fail(404, "Chat not found.");
+  const key = `msg/${id}/${suffix}`;
+  const msg = await msgs().get(key, { type: "json" });
+  if (!msg) return fail(404, "Message not found.");
+  if (msg.from !== me) return fail(403, "You can only delete your own messages.");
+  if (!msg.deleted) {
+    // Erase the text for real; keep a tombstone so message order and keys stay stable.
+    await msgs().setJSON(key, { from: msg.from, ts: msg.ts, deleted: true });
+    // Marker that lets clients who already showed the message learn it was deleted.
+    await msgs().setJSON(`del/${id}/${suffix}`, true);
+    const { blobs } = await msgs().list({ prefix: `msg/${id}/` });
+    const latest = blobs.map((b) => b.key).sort().pop();
+    const isLatest = latest === key;
+    await updateIndex(chat, (m, cur) => {
+      let unread = cur.unread || 0;
+      // If this recipient hadn't read it yet, it no longer counts as unread.
+      if (m !== me && msg.ts > (cur.readTs || 0) && unread > 0) unread--;
+      return { ...cur, unread, ...(isLatest ? { preview: `${me} deleted a message` } : {}) };
+    });
+  }
+  return json({ ok: true });
+}
+
+// The client reports "I have seen everything up to timestamp upTo".
+async function markRead(me, id, req) {
+  const chat = await loadChatFor(id, me);
+  if (!chat) return fail(404, "Chat not found.");
+  const t = Number((await readBody(req)).upTo);
+  if (!Number.isFinite(t) || t <= 0) return fail(400, "Bad timestamp.");
+  const key = `idx/${me}/${id}`;
+  const cur = await index().get(key, { type: "json" });
+  if (!cur) return json({ ok: true });
+  const readTs = Math.max(cur.readTs || 0, t);
+  // Only clear the badge if nothing newer than what the client saw has arrived meanwhile.
+  const unread = t >= (cur.last || 0) ? 0 : cur.unread || 0;
+  if (readTs !== (cur.readTs || 0) || unread !== (cur.unread || 0)) {
+    await index().setJSON(key, { ...cur, readTs, unread });
+    await bumpVersion([me]); // only my other tabs/devices need to know
+  }
+  return json({ ok: true });
 }
 
 // ---------- entry ----------
@@ -258,6 +393,12 @@ export default async (req) => {
     const m = path.match(/^\/chats\/([\w-]+)\/messages$/);
     if (m && method === "GET") return await getMessages(me, m[1], url);
     if (m && method === "POST") return await sendMessage(me, m[1], req);
+
+    const rd = path.match(/^\/chats\/([\w-]+)\/read$/);
+    if (rd && method === "POST") return await markRead(me, rd[1], req);
+
+    const d = path.match(/^\/chats\/([\w-]+)\/messages\/(\d{13}-[0-9a-f]{6})$/);
+    if (d && method === "DELETE") return await deleteMessage(me, d[1], d[2]);
 
     return fail(404, "Not found.");
   } catch (err) {
