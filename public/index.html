@@ -55,6 +55,8 @@
   .chat-row .name { font-weight: 600; display: flex; gap: 6px; align-items: center; }
   .chat-row .tag { font-size: 11px; font-weight: 500; color: var(--muted); border: 1px solid var(--line); border-radius: 10px; padding: 0 6px; }
   .chat-row .prev { color: var(--muted); font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .chat-row.unread .prev { color: var(--ink); font-weight: 600; }
+  .badge { margin-left: auto; min-width: 20px; padding: 0 7px; border-radius: 10px; background: var(--accent); color: var(--accent-ink); font-size: 12px; font-weight: 700; text-align: center; line-height: 20px; }
   .empty { color: var(--muted); padding: 24px 14px; text-align: center; }
 
   main { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
@@ -66,7 +68,9 @@
   .msg { max-width: min(75%, 520px); padding: 8px 12px; border-radius: 14px; background: var(--theirs); word-wrap: break-word; white-space: pre-wrap; align-self: flex-start; }
   .msg.mine { background: var(--mine); color: var(--mine-ink); align-self: flex-end; }
   .msg .who { font-size: 12px; font-weight: 600; color: var(--accent); margin-bottom: 2px; }
-  .msg .time { font-size: 11px; opacity: .65; margin-top: 2px; text-align: right; }
+  .msg .time { font-size: 11px; opacity: .65; margin-top: 2px; display: flex; justify-content: flex-end; gap: 10px; }
+  .msg .del { background: none; border: 0; padding: 0; color: inherit; font-size: 11px; text-decoration: underline; }
+  .msg.deleted { font-style: italic; opacity: .6; }
   .placeholder { margin: auto; color: var(--muted); }
   form#composer { display: flex; gap: 8px; padding: 12px; background: var(--panel); border-top: 1px solid var(--line); }
   form#composer input { flex: 1; }
@@ -138,7 +142,8 @@
 
 <script>
 const $ = (id) => document.getElementById(id);
-const state = { me: null, chats: [], active: null, lastKey: null, seen: new Set(), mode: "login",
+const state = { me: null, chats: [], active: null, lastKey: null, seen: new Set(), els: new Map(), mode: "login",
+  maxTs: 0, readSent: new Map(),
   version: "", idle: 0, syncing: null, again: false, timer: null };
 
 async function api(path, opts = {}) {
@@ -193,6 +198,7 @@ $("logoutBtn").onclick = async () => {
 /* ---------- app ---------- */
 function startApp(username) {
   state.me = username;
+  state.readSent = new Map();
   $("meName").textContent = "@" + username;
   $("auth").classList.add("hidden");
   $("app").classList.remove("hidden");
@@ -207,9 +213,18 @@ function chatLabel(c) {
 
 async function refreshChats() { await sync(true); }
 
+// The chat you're looking at (in a visible tab) counts as read, so show 0 for it right away
+// instead of waiting for the server round-trip.
+function unreadOf(c) {
+  const viewing = state.active && state.active.id === c.id && !document.hidden;
+  return viewing ? 0 : c.unread || 0;
+}
+
 function renderChatList() {
   const box = $("chatList");
   box.textContent = "";
+  const total = state.chats.reduce((n, c) => n + unreadOf(c), 0);
+  document.title = total ? `(${total > 99 ? "99+" : total}) Netlify Chat` : "Netlify Chat";
   if (!state.chats.length) {
     const d = document.createElement("div");
     d.className = "empty";
@@ -218,8 +233,9 @@ function renderChatList() {
     return;
   }
   for (const c of state.chats) {
+    const unread = unreadOf(c);
     const row = document.createElement("div");
-    row.className = "chat-row" + (state.active && state.active.id === c.id ? " active" : "");
+    row.className = "chat-row" + (state.active && state.active.id === c.id ? " active" : "") + (unread ? " unread" : "");
     const name = document.createElement("div");
     name.className = "name";
     name.textContent = chatLabel(c);
@@ -228,6 +244,12 @@ function renderChatList() {
       tag.className = "tag";
       tag.textContent = c.members.length + " members";
       name.appendChild(tag);
+    }
+    if (unread) {
+      const badge = document.createElement("span");
+      badge.className = "badge";
+      badge.textContent = unread > 99 ? "99+" : String(unread);
+      name.appendChild(badge);
     }
     const prev = document.createElement("div");
     prev.className = "prev";
@@ -241,7 +263,7 @@ function renderChatList() {
 function openChat(c) {
   state.active = c;
   state.lastKey = null;
-  state.seen = new Set();
+  state.seen = new Set(); state.els = new Map(); state.maxTs = 0;
   $("app").classList.add("in-chat");
   $("chatTitle").textContent = chatLabel(c);
   $("chatSub").textContent = c.type === "group" ? c.members.join(", ") : "Direct message";
@@ -255,7 +277,7 @@ function openChat(c) {
 function closeChat() {
   state.active = null;
   state.lastKey = null;
-  state.seen = new Set();
+  state.seen = new Set(); state.els = new Map(); state.maxTs = 0;
   $("app").classList.remove("in-chat");
   $("chatTitle").textContent = "Select a chat";
   $("chatSub").textContent = "";
@@ -290,15 +312,64 @@ function appendMessages(list) {
       div.appendChild(who);
     }
     const body = document.createElement("div");
-    body.textContent = m.text;
+    body.className = "body";
     const time = document.createElement("div");
     time.className = "time";
-    time.textContent = fmtTime(m.ts);
+    const t = document.createElement("span");
+    t.textContent = fmtTime(m.ts);
+    time.appendChild(t);
+    if (m.from === state.me) {
+      const del = document.createElement("button");
+      del.type = "button";
+      del.className = "del";
+      del.textContent = "Delete";
+      del.onclick = () => deleteMessage(m.key);
+      time.prepend(del);
+    }
     div.append(body, time);
+    div.dataset.key = m.key;
+    state.els.set(m.key, div);
+    if (m.deleted) markDeleted(div); else body.textContent = m.text;
     box.appendChild(div);
     if (!state.lastKey || m.key > state.lastKey) state.lastKey = m.key;
+    if (m.ts > state.maxTs) state.maxTs = m.ts;
   }
   if (added && (nearBottom || list[list.length - 1].from === state.me)) box.scrollTop = box.scrollHeight;
+}
+
+// Tell the server how far we've read, but only while the tab is actually visible.
+function markRead() {
+  const chat = state.active;
+  if (!chat || document.hidden || !state.maxTs) return;
+  const upTo = state.maxTs;
+  if ((state.readSent.get(chat.id) || 0) >= upTo) return;
+  state.readSent.set(chat.id, upTo);
+  api(`/chats/${encodeURIComponent(chat.id)}/read`, { method: "POST", body: { upTo } })
+    .catch(() => state.readSent.delete(chat.id)); // retry on the next sync
+}
+
+function markDeleted(div) {
+  div.classList.add("deleted");
+  div.querySelector(".body").textContent = "Message deleted";
+  div.querySelector(".del")?.remove();
+}
+
+function applyDeleted(suffixes) {
+  for (const s of suffixes) {
+    const el = state.els.get(`msg/${state.active.id}/${s}`);
+    if (el && !el.classList.contains("deleted")) markDeleted(el);
+  }
+}
+
+async function deleteMessage(key) {
+  const chat = state.active;
+  if (!chat || !confirm("Delete this message for everyone?")) return;
+  try {
+    await api(`/chats/${encodeURIComponent(chat.id)}/messages/${key.split("/").pop()}`, { method: "DELETE" });
+    const el = state.els.get(key);
+    if (el && state.active === chat) markDeleted(el);
+    poke();
+  } catch (e) { alert(e.message); }
 }
 
 function applyMessages(messages, wasInitial) {
@@ -336,7 +407,11 @@ async function runSync(force) {
     state.idle = 0;
     state.chats = d.chats;
     renderChatList();
-    if (d.messages && state.active === chat) applyMessages(d.messages, wasInitial);
+    if (d.messages && state.active === chat) {
+      applyMessages(d.messages, wasInitial);
+      if (d.deleted) applyDeleted(d.deleted);
+      markRead();
+    }
   } catch { /* network hiccup: try again on the next tick */ }
 }
 
@@ -391,7 +466,11 @@ function poke() {
 }
 function startPolling() { state.version = ""; poke(); }
 function stopPolling() { clearTimeout(state.timer); state.version = ""; }
-document.addEventListener("visibilitychange", () => { if (!document.hidden && state.me) poke(); });
+document.addEventListener("visibilitychange", () => {
+  if (!state.me) return;
+  renderChatList();
+  if (!document.hidden) { markRead(); poke(); }
+});
 $("text").addEventListener("input", () => { state.idle = 0; });
 
 /* ---------- modals ---------- */
