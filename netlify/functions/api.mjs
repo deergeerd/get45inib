@@ -8,6 +8,8 @@ const chats = () => store("chats"); //  c/<chatId>
 const index = () => store("chat-index"); //  idx/<username>/<chatId>
 const msgs = () => store("messages"); //  msg/<chatId>/<ts>-<rand>
 const rl = () => store("ratelimit"); //  login/u/<hash>, login/ip/<hash>, signup/ip/<hash>
+const typingStore = () => store("typing"); //  t/<chatId> -> { username: lastPingMs }
+const TYPING_TTL = 6000; // a typer is shown for this long after their last ping (clients ping every ~2.5s)
 
 // ---------- helpers ----------
 const json = (data, status = 200, headers = {}) =>
@@ -227,7 +229,10 @@ async function chatsFor(me) {
     blobs.map(async (b) => {
       const idx = await index().get(b.key, { type: "json" });
       const chat = idx && (await chats().get(`c/${idx.chatId}`, { type: "json" }));
-      return chat ? { ...chat, last: idx.last, preview: idx.preview, unread: idx.unread || 0 } : null;
+      // Re-check membership: a stale index entry must never expose a chat someone was removed from.
+      return chat && chat.members.includes(me)
+        ? { ...chat, last: idx.last, preview: idx.preview, unread: idx.unread || 0 }
+        : null;
     })
   );
   return rows.filter(Boolean).sort((a, b) => (b.last || 0) - (a.last || 0));
@@ -293,14 +298,23 @@ async function getMessages(me, id, url) {
 // it answers 204 with no body, after a single blob read.
 async function sync(me, url) {
   const clientV = url.searchParams.get("v") || "";
+  const clientT = url.searchParams.get("t") || ""; // typers the client is currently showing
+  const rawChat = url.searchParams.get("chat");
+  const chatId = rawChat && /^[\w-]+$/.test(rawChat) ? rawChat : null;
   // Read the version BEFORE the data: if something changes mid-read, the next poll sees a newer version.
   const v = (await index().get(`ver/${me}`, { type: "json" })) || "0";
-  if (clientV && clientV === v) {
+  // Who is typing in the open chat (null if it isn't a chat I'm in). Typing never touches versions.
+  const typing = chatId ? await typersFor(me, chatId) : null;
+  const sig = typing ? typing.join(",") : "";
+  const versionSame = clientV && clientV === v;
+  if (versionSame && sig === clientT) {
     return new Response(null, { status: 204, headers: { "Cache-Control": "no-store" } });
   }
+  // Only the typing state changed: a tiny reply without the chat list or messages.
+  if (versionSame) return json({ v, typing: typing || [] });
   const out = { v, chats: await chatsFor(me) };
-  const chatId = url.searchParams.get("chat");
-  if (chatId && /^[\w-]+$/.test(chatId)) {
+  if (typing) out.typing = typing;
+  if (chatId) {
     const messages = await messagesFor(me, chatId, url.searchParams.get("after"));
     if (messages) {
       out.messages = messages;
@@ -321,6 +335,7 @@ async function sendMessage(me, id, req) {
   const ts = Date.now();
   const key = `msg/${id}/${String(ts).padStart(13, "0")}-${rand(3)}`;
   await msgs().setJSON(key, { from: me, text: clean, ts });
+  await clearTyping(me, id);
   await touchIndex(chat, ts, `${me}: ${clean.slice(0, 60)}`, me);
   return json({ ok: true, key });
 }
@@ -331,6 +346,7 @@ async function deleteMessage(me, id, suffix) {
   const key = `msg/${id}/${suffix}`;
   const msg = await msgs().get(key, { type: "json" });
   if (!msg) return fail(404, "Message not found.");
+  if (msg.system) return fail(403, "Notices can't be deleted.");
   if (msg.from !== me) return fail(403, "You can only delete your own messages.");
   if (!msg.deleted) {
     // Erase the text for real; keep a tombstone so message order and keys stay stable.
@@ -369,6 +385,104 @@ async function markRead(me, id, req) {
   return json({ ok: true });
 }
 
+// ---------- typing indicator ----------
+async function typersFor(me, id) {
+  const chat = await loadChatFor(id, me);
+  if (!chat) return null;
+  const cur = (await typingStore().get(`t/${id}`, { type: "json" })) || {};
+  const now = Date.now();
+  return Object.entries(cur)
+    .filter(([u, t]) => u !== me && chat.members.includes(u) && now - t < TYPING_TTL)
+    .map(([u]) => u)
+    .sort();
+}
+
+async function setTyping(me, id, req) {
+  const chat = await loadChatFor(id, me);
+  if (!chat) return fail(404, "Chat not found.");
+  const { typing } = await readBody(req);
+  const now = Date.now();
+  const cur = (await typingStore().get(`t/${id}`, { type: "json" })) || {};
+  for (const [u, t] of Object.entries(cur)) if (now - t > 10_000) delete cur[u]; // tidy old entries
+  if (typing === false) delete cur[me];
+  else cur[me] = now;
+  await typingStore().setJSON(`t/${id}`, cur);
+  return json({ ok: true });
+}
+
+// Sending a message ends "typing" immediately, so the indicator vanishes together with the new message.
+async function clearTyping(me, id) {
+  const cur = await typingStore().get(`t/${id}`, { type: "json" });
+  if (cur && cur[me]) {
+    delete cur[me];
+    await typingStore().setJSON(`t/${id}`, cur);
+  }
+}
+
+// ---------- group membership ----------
+const MAX_GROUP = 50;
+
+// A centered notice in the conversation ("alice added dave"). Doesn't count as unread.
+async function postSystem(chat, actor, text) {
+  const ts = Date.now();
+  const key = `msg/${chat.id}/${String(ts).padStart(13, "0")}-${rand(3)}`;
+  await msgs().setJSON(key, { from: actor, text, ts, system: true });
+  await touchIndex(chat, ts, text);
+}
+
+// Any member can add people.
+async function addMembers(me, id, req) {
+  const chat = await loadChatFor(id, me);
+  if (!chat) return fail(404, "Chat not found.");
+  if (chat.type !== "group") return fail(400, "Only groups can have people added.");
+  const { add } = await readBody(req);
+  const wanted = [...new Set((Array.isArray(add) ? add : []).map((u) => String(u).toLowerCase()))]
+    .filter((u) => USERNAME_RE.test(u) && !chat.members.includes(u));
+  if (!wanted.length) return fail(400, "Nobody new to add.");
+  if (chat.members.length + wanted.length > MAX_GROUP) return fail(400, `Groups are limited to ${MAX_GROUP} members.`);
+  const found = await Promise.all(wanted.map((u) => users().get(`u/${u}`)));
+  const missing = wanted.filter((_, i) => !found[i]);
+  if (missing.length) return fail(404, `Unknown user(s): ${missing.join(", ")}`);
+
+  chat.members = [...chat.members, ...wanted];
+  await chats().setJSON(`c/${id}`, chat);
+  await postSystem(chat, me, `${me} added ${wanted.join(", ")}`); // also creates the new members' index entries
+  return json({ chat });
+}
+
+// Leave (target === me) or, for the owner, remove someone else.
+async function removeMember(me, id, target) {
+  const chat = await loadChatFor(id, me);
+  if (!chat) return fail(404, "Chat not found.");
+  if (chat.type !== "group") return fail(400, "You can't leave a direct message.");
+  if (!chat.members.includes(target)) return fail(404, "That person isn't in this group.");
+  const leaving = target === me;
+  if (!leaving && chat.owner !== me) return fail(403, "Only the group owner can remove people.");
+
+  chat.members = chat.members.filter((m) => m !== target);
+
+  if (!chat.members.length) {
+    // Last person left: delete the group and its messages.
+    await chats().delete(`c/${id}`);
+    await typingStore().delete(`t/${id}`);
+    await index().delete(`idx/${target}/${id}`);
+    const keys = [
+      ...(await msgs().list({ prefix: `msg/${id}/` })).blobs,
+      ...(await msgs().list({ prefix: `del/${id}/` })).blobs,
+    ].map((b) => b.key);
+    for (let i = 0; i < keys.length; i += 25) await Promise.all(keys.slice(i, i + 25).map((k) => msgs().delete(k)));
+    await bumpVersion([target]);
+    return json({ ok: true, gone: true });
+  }
+
+  if (chat.owner === target) chat.owner = chat.members[0]; // oldest remaining member
+  await chats().setJSON(`c/${id}`, chat); // access is revoked from this write on
+  await index().delete(`idx/${target}/${id}`);
+  await bumpVersion([target]); // so their client notices straight away
+  await postSystem(chat, me, leaving ? `${me} left` : `${me} removed ${target}`);
+  return json({ ok: true, chat });
+}
+
 // ---------- entry ----------
 export default async (req) => {
   try {
@@ -393,6 +507,14 @@ export default async (req) => {
     const m = path.match(/^\/chats\/([\w-]+)\/messages$/);
     if (m && method === "GET") return await getMessages(me, m[1], url);
     if (m && method === "POST") return await sendMessage(me, m[1], req);
+
+    const ty = path.match(/^\/chats\/([\w-]+)\/typing$/);
+    if (ty && method === "POST") return await setTyping(me, ty[1], req);
+
+    const mb = path.match(/^\/chats\/([\w-]+)\/members$/);
+    if (mb && method === "POST") return await addMembers(me, mb[1], req);
+    const mr = path.match(/^\/chats\/([\w-]+)\/members\/([a-z0-9_]{3,20})$/);
+    if (mr && method === "DELETE") return await removeMember(me, mr[1], mr[2]);
 
     const rd = path.match(/^\/chats\/([\w-]+)\/read$/);
     if (rd && method === "POST") return await markRead(me, rd[1], req);
