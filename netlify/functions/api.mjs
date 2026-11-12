@@ -189,7 +189,7 @@ async function signup(req) {
   if (await users().get(`u/${name}`)) return fail(409, "That username is taken.");
   const { salt, hash } = hashPassword(password);
   await users().setJSON(`u/${name}`, { username: name, salt, hash, created: Date.now() });
-  return json({ username: name }, 200, { "Set-Cookie": sessionCookie(name) });
+  return json({ username: name, prefs: DEFAULT_PREFS }, 200, { "Set-Cookie": sessionCookie(name) });
 }
 
 async function login(req) {
@@ -212,7 +212,7 @@ async function login(req) {
     return fail(401, "Wrong username or password.");
   }
   await rl().delete(ukey); // success clears this username's failures (the IP's count is kept on purpose)
-  return json({ username: name }, 200, { "Set-Cookie": sessionCookie(name) });
+  return json({ username: name, prefs: await getPrefs(name) }, 200, { "Set-Cookie": sessionCookie(name) });
 }
 
 async function searchUsers(me, url) {
@@ -385,6 +385,52 @@ async function markRead(me, id, req) {
   return json({ ok: true });
 }
 
+// ---------- preferences ----------
+// Only known names and plain #rrggbb colours are ever stored or returned, so nothing else can
+// reach the page (the client turns them into CSS itself).
+const PREF_OPTIONS = {
+  theme: ["system", "light", "dark", "custom"],
+  accent: ["green", "blue", "purple", "rose", "orange", "slate", "custom"],
+  wallpaper: ["none", "tint", "dots", "grid", "stripes"],
+};
+const COLOR_KEYS = ["customAccent", "customTheme"]; // each a "#rrggbb" string, or null
+const HEX_RE = /^#[0-9a-f]{6}$/;
+const DEFAULT_PREFS = { theme: "system", accent: "green", wallpaper: "none", customAccent: null, customTheme: null };
+
+async function getPrefs(name) {
+  const saved = (await users().get(`prefs/${name}`, { type: "json" })) || {};
+  const out = { ...DEFAULT_PREFS };
+  for (const k of Object.keys(PREF_OPTIONS)) if (PREF_OPTIONS[k].includes(saved[k])) out[k] = saved[k]; // re-checked on read too
+  for (const k of COLOR_KEYS) if (typeof saved[k] === "string" && HEX_RE.test(saved[k])) out[k] = saved[k];
+  // "custom" without its colour can't be shown; fall back rather than break the page.
+  if (out.theme === "custom" && !out.customTheme) out.theme = DEFAULT_PREFS.theme;
+  if (out.accent === "custom" && !out.customAccent) out.accent = DEFAULT_PREFS.accent;
+  return out;
+}
+
+async function savePrefs(me, req) {
+  const body = await readBody(req);
+  if (!body || typeof body !== "object" || Array.isArray(body)) return fail(400, "Bad request.");
+  const prefs = await getPrefs(me);
+  for (const [k, v] of Object.entries(body)) {
+    if (COLOR_KEYS.includes(k)) {
+      const hex = typeof v === "string" ? v.toLowerCase() : v;
+      if (hex !== null && !(typeof hex === "string" && HEX_RE.test(hex))) return fail(400, `Invalid color for ${k}. Use the form #rrggbb.`);
+      prefs[k] = hex;
+    } else if (!Object.hasOwn(PREF_OPTIONS, k)) {
+      return fail(400, `Unknown setting: ${k}`);
+    } else if (!PREF_OPTIONS[k].includes(v)) {
+      return fail(400, `Invalid value for ${k}.`);
+    } else {
+      prefs[k] = v;
+    }
+  }
+  if (prefs.theme === "custom" && !prefs.customTheme) return fail(400, "Pick a theme color first.");
+  if (prefs.accent === "custom" && !prefs.customAccent) return fail(400, "Pick an accent color first.");
+  await users().setJSON(`prefs/${me}`, prefs);
+  return json({ prefs });
+}
+
 // ---------- typing indicator ----------
 async function typersFor(me, id) {
   const chat = await loadChatFor(id, me);
@@ -499,7 +545,9 @@ export default async (req) => {
     const me = session.u;
 
     if (method === "GET" && path === "/sync") return await sync(me, url);
-    if (method === "GET" && path === "/me") return json({ username: me });
+    if (method === "GET" && path === "/me") return json({ username: me, prefs: await getPrefs(me) });
+    if (method === "GET" && path === "/settings") return json({ prefs: await getPrefs(me) });
+    if (method === "PUT" && path === "/settings") return await savePrefs(me, req);
     if (method === "GET" && path === "/users") return await searchUsers(me, url);
     if (method === "GET" && path === "/chats") return await listChats(me);
     if (method === "POST" && path === "/chats") return await createChat(me, req);
