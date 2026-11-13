@@ -2,8 +2,17 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Netlify Chat</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<meta name="theme-color" content="#ffffff">
+<meta name="application-name" content="Chat">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Chat">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<link rel="icon" type="image/png" href="/icons/icon-192.png">
+<link rel="apple-touch-icon" href="/icons/apple-touch-icon.png">
 <script>
   // Apply the last-used look straight away so there's no flash of the wrong theme while the page loads.
   try {
@@ -117,7 +126,7 @@
   .err { color: #c0392b; min-height: 20px; margin: 8px 0 0; font-size: 13px; }
 
   /* app */
-  #app { height: 100%; display: grid; grid-template-columns: 300px 1fr; }
+  #app { height: 100%; display: grid; grid-template-columns: 300px 1fr; padding-left: env(safe-area-inset-left); padding-right: env(safe-area-inset-right); }
   aside { background: var(--panel); border-right: 1px solid var(--line); display: flex; flex-direction: column; min-height: 0; }
   .side-head { padding: 14px; border-bottom: 1px solid var(--line); display: flex; align-items: center; justify-content: space-between; gap: 8px; }
   .side-head strong { font-size: 16px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -153,8 +162,28 @@
   .msg.deleted { font-style: italic; opacity: .6; }
   .day { align-self: center; margin: 12px 0 6px; padding: 3px 12px; border-radius: 10px; background: var(--theirs); color: var(--muted); font-size: 12px; font-weight: 600; }
   .placeholder { margin: auto; color: var(--muted); }
-  form#composer { display: flex; gap: 8px; padding: 12px; background: var(--panel); border-top: 1px solid var(--line); }
+  form#composer { display: flex; gap: 8px; padding: 12px 12px max(12px, env(safe-area-inset-bottom)); background: var(--panel); border-top: 1px solid var(--line); }
+  aside { padding-bottom: env(safe-area-inset-bottom); }
+  .install-hint { color: var(--muted); font-size: 13px; margin: 6px 0 14px; }
   form#composer input { flex: 1; }
+
+  /* photos */
+  form#composer .attach { padding: 8px 12px; font-size: 18px; line-height: 1; }
+  .msg .media { display: block; padding: 0; border: 0; background: rgba(128,128,128,.18); border-radius: 10px; overflow: hidden; max-width: 100%; cursor: zoom-in; color: inherit; }
+  .msg .media img { display: block; width: 100%; height: 100%; object-fit: cover; }
+  .msg .media.broken { cursor: default; display: grid; place-items: center; min-height: 80px; width: 200px; font-size: 13px; font-style: italic; opacity: .75; }
+  .msg .caption { margin-top: 6px; }
+  main.dropping { outline: 3px dashed var(--accent); outline-offset: -6px; }
+  .photo-preview { display: block; max-width: 100%; max-height: 240px; margin: 0 auto 12px; border-radius: 10px; }
+  .photo-note { color: var(--muted); font-size: 13px; margin: 8px 0; min-height: 1.2em; }
+  .photo-note.err { color: #c0392b; }
+  .bar { height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; margin: 8px 0; }
+  .bar > i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .15s; }
+  .modal .row-end { display: flex; gap: 8px; justify-content: flex-end; margin-top: 12px; }
+  .lightbox { position: fixed; inset: 0; z-index: 20; background: rgba(0,0,0,.88); display: grid; place-items: center; padding: 12px; cursor: zoom-out; }
+  .lightbox img { max-width: 100%; max-height: 100%; object-fit: contain; border-radius: 4px; }
+  .lightbox .cap { position: absolute; left: 0; right: 0; bottom: 0; padding: 12px 16px; color: #fff; background: linear-gradient(transparent, rgba(0,0,0,.7)); text-align: center; white-space: pre-wrap; }
+  .lightbox .x { position: absolute; top: 10px; right: 12px; background: rgba(255,255,255,.18); color: #fff; border: 0; border-radius: 20px; width: 36px; height: 36px; font-size: 20px; }
 
   /* modal */
   .overlay { position: fixed; inset: 0; background: rgba(0,0,0,.45); display: grid; place-items: center; padding: 16px; z-index: 10; }
@@ -217,6 +246,8 @@
     </div>
     <div id="messages"><div class="placeholder">Pick a chat or start a new one.</div></div>
     <form id="composer" class="hidden">
+      <button class="btn ghost attach" id="attachBtn" type="button" aria-label="Send a photo" title="Send a photo">&#128247;</button>
+      <input type="file" id="fileInput" class="hidden" accept="image/*">
       <input type="text" id="text" placeholder="Type a message" autocomplete="off" maxlength="2000">
       <button class="btn" type="submit">Send</button>
     </form>
@@ -393,6 +424,16 @@ function presetColor(name, mode) {
 /* ---------- look & feel ---------- */
 const MANAGED_VARS = ["--bg", "--panel", "--ink", "--muted", "--line", "--theirs", "--bad", "--accent-ink", "--accent", "--mine", "--accent-l", "--mine-l", "--accent-d", "--mine-d"];
 
+// The phone's status bar / the app window's title bar takes the colour of the header.
+function syncThemeColor() {
+  try {
+    const cs = getComputedStyle(document.documentElement);
+    const c = cs.getPropertyValue("--panel").trim() || getComputedStyle(document.body).backgroundColor;
+    document.querySelector('meta[name="theme-color"]').setAttribute("content", c);
+  } catch {}
+}
+if (window.matchMedia) matchMedia("(prefers-color-scheme: dark)").addEventListener?.("change", syncThemeColor);
+
 function applyPrefs(p) {
   state.prefs = { ...DEFAULT_PREFS, ...p };
   const P = state.prefs, r = document.documentElement, st = r.style;
@@ -430,6 +471,7 @@ function applyPrefs(p) {
   }
   r.dataset.accent = P.accent === "custom" && !customAccent ? DEFAULT_PREFS.accent : P.accent;
   r.dataset.wallpaper = P.wallpaper;
+  syncThemeColor();
   try { // so the next page load can paint the right colours before the network answers
     localStorage.setItem("look", JSON.stringify({ theme: r.dataset.theme || null, mode: r.dataset.mode || null, accent: r.dataset.accent, wallpaper: r.dataset.wallpaper, style: r.getAttribute("style") || "" }));
   } catch {}
@@ -667,7 +709,11 @@ function appendMessages(list) {
     div.append(body, time);
     div.dataset.key = m.key;
     state.els.set(m.key, div);
-    if (m.deleted) markDeleted(div); else body.textContent = m.text;
+    if (m.deleted) markDeleted(div);
+    else if (m.image) {
+      body.appendChild(makeMedia(state.active.id, m.image, m.text));
+      if (m.text) { const c = document.createElement("div"); c.className = "caption"; c.textContent = m.text; body.appendChild(c); }
+    } else body.textContent = m.text;
     box.appendChild(div);
     if (!state.lastKey || m.key > state.lastKey) state.lastKey = m.key;
     if (m.ts > state.maxTs) state.maxTs = m.ts;
@@ -858,6 +904,221 @@ $("text").addEventListener("input", () => {
   }
   const now = Date.now();
   if (now - state.lastPing > 2500) { state.lastPing = now; sendTyping(chat, true); }
+});
+
+/* ---------- photos ---------- */
+const IMG_FULL_EDGE = 1600, IMG_THUMB_EDGE = 480, IMG_MAX = 3 * 1024 * 1024, THUMB_MAX = 300 * 1024, IMG_INPUT_MAX = 40 * 1024 * 1024;
+const imgUrl = (chatId, id, full) => `/api/chats/${encodeURIComponent(chatId)}/images/${id}${full ? "?size=full" : ""}`;
+
+// Size in the conversation: reserve the exact space before the picture arrives, so the page never jumps.
+function makeMedia(chatId, im, caption) {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "media";
+  btn.setAttribute("aria-label", caption ? "Open photo: " + caption : "Open photo");
+  const k = Math.min(1, 300 / im.w, 360 / im.h);
+  btn.style.width = Math.max(60, Math.round(im.w * k)) + "px";
+  btn.style.aspectRatio = `${im.w} / ${im.h}`;
+  const img = new Image();
+  img.alt = caption || "Photo";
+  img.loading = "lazy";
+  img.decoding = "async";
+  img.onerror = () => {
+    btn.className = "media broken";
+    btn.removeAttribute("style");
+    btn.disabled = true;
+    btn.replaceChildren(document.createTextNode("Photo unavailable"));
+  };
+  img.src = imgUrl(chatId, im.id, false);
+  btn.appendChild(img);
+  btn.onclick = () => openLightbox(chatId, im, caption);
+  return btn;
+}
+
+function openLightbox(chatId, im, caption) {
+  const ov = document.createElement("div");
+  ov.className = "lightbox";
+  const img = new Image();
+  img.alt = caption || "Photo";
+  img.src = imgUrl(chatId, im.id, true);
+  const x = document.createElement("button");
+  x.type = "button"; x.className = "x"; x.textContent = "×"; x.setAttribute("aria-label", "Close");
+  ov.append(img, x);
+  if (caption) { const c = document.createElement("div"); c.className = "cap"; c.textContent = caption; ov.appendChild(c); }
+  const close = () => { ov.remove(); document.removeEventListener("keydown", onKey); };
+  const onKey = (e) => { if (e.key === "Escape") close(); };
+  document.addEventListener("keydown", onKey);
+  ov.onclick = close;
+  $("modalRoot").appendChild(ov);
+}
+
+const canvasBlob = (cv, q) => new Promise((res, rej) => cv.toBlob((b) => (b ? res(b) : rej(new Error("Couldn't process that image."))), "image/jpeg", q));
+
+async function decodeImage(file) {
+  if (window.createImageBitmap) { try { return await createImageBitmap(file); } catch { /* fall back below */ } }
+  const url = URL.createObjectURL(file);
+  try {
+    return await new Promise((res, rej) => {
+      const im = new Image();
+      im.onload = () => res(im);
+      im.onerror = () => rej(new Error("That file can't be read as an image."));
+      im.src = url;
+    });
+  } finally { URL.revokeObjectURL(url); }
+}
+
+// Draw into a canvas and re-encode as JPEG: this shrinks the photo and drops its hidden metadata
+// (camera, location). Quality, then size, step down until it fits under the cap.
+async function renderJpeg(src, sw, sh, maxEdge, maxBytes, q) {
+  let scale = Math.min(1, maxEdge / Math.max(sw, sh));
+  for (let i = 0; i < 10; i++) {
+    const w = Math.max(1, Math.round(sw * scale)), h = Math.max(1, Math.round(sh * scale));
+    const cv = document.createElement("canvas");
+    cv.width = w; cv.height = h;
+    const cx = cv.getContext("2d");
+    cx.fillStyle = "#fff"; cx.fillRect(0, 0, w, h); // transparent PNGs become white, not black
+    cx.drawImage(src, 0, 0, w, h);
+    const blob = await canvasBlob(cv, q);
+    if (blob.size <= maxBytes) return { blob, w, h };
+    if (q > 0.55) q -= 0.12; else scale *= 0.8;
+  }
+  throw new Error("That image is too large to send.");
+}
+
+async function prepareImage(file) {
+  if (file.type && !file.type.startsWith("image/")) throw new Error("Only images can be sent.");
+  if (file.size > IMG_INPUT_MAX) throw new Error("That file is too big (40 MB maximum).");
+  const src = await decodeImage(file);
+  const sw = src.naturalWidth || src.width, sh = src.naturalHeight || src.height;
+  if (!sw || !sh) throw new Error("That file can't be read as an image.");
+  const thumb = await renderJpeg(src, sw, sh, IMG_THUMB_EDGE, THUMB_MAX, 0.8);
+  let full, w, h;
+  if (file.type === "image/gif") { // keep the animation as-is
+    if (file.size > IMG_MAX) throw new Error("That GIF is bigger than 3 MB.");
+    full = file; w = sw; h = sh;
+  } else {
+    const r = await renderJpeg(src, sw, sh, IMG_FULL_EDGE, IMG_MAX, 0.85);
+    full = r.blob; w = r.w; h = r.h;
+  }
+  if (src.close) src.close();
+  return { full, thumb: thumb.blob, w, h };
+}
+
+// XHR rather than fetch, because it reports upload progress.
+function uploadImage(chatId, p, text, onProgress) {
+  let xhr;
+  const promise = new Promise((resolve, reject) => {
+    const fd = new FormData();
+    fd.set("image", p.full, "photo");
+    fd.set("thumb", p.thumb, "thumb.jpg");
+    fd.set("w", String(p.w));
+    fd.set("h", String(p.h));
+    if (text) fd.set("text", text);
+    xhr = new XMLHttpRequest();
+    xhr.open("POST", `/api/chats/${encodeURIComponent(chatId)}/images`);
+    xhr.withCredentials = true;
+    xhr.upload.onprogress = (e) => { if (e.lengthComputable) onProgress(e.loaded / e.total); };
+    xhr.onload = () => {
+      let data = {};
+      try { data = JSON.parse(xhr.responseText); } catch { /* not JSON */ }
+      if (xhr.status >= 200 && xhr.status < 300) return resolve(data);
+      const e = new Error(data.error || (xhr.status === 413 ? "That image is too large." : "Upload failed."));
+      e.status = xhr.status;
+      reject(e);
+    };
+    xhr.onerror = () => reject(new Error("Network problem. Check your connection and try again."));
+    xhr.onabort = () => reject(new Error("Cancelled."));
+    xhr.send(fd);
+  });
+  return { promise, abort: () => xhr && xhr.abort() };
+}
+
+function pickImage(file) {
+  const chat = state.active;
+  if (!chat || !file || $("modalRoot").querySelector(".overlay")) return;
+  openModal((modal, close) => {
+    const overlay = modal.parentNode;
+    let prepared = null, busy = false, upload = null, previewUrl = null;
+    const h2 = document.createElement("h2");
+    h2.textContent = "Send photo";
+    const slot = document.createElement("div");
+    const note = document.createElement("div");
+    note.className = "photo-note";
+    note.textContent = "Preparing…";
+    const caption = document.createElement("input");
+    caption.type = "text"; caption.placeholder = "Add a caption (optional)"; caption.maxLength = 500; caption.autocomplete = "off";
+    const bar = document.createElement("div");
+    bar.className = "bar hidden";
+    const fill = document.createElement("i");
+    bar.appendChild(fill);
+    const row = document.createElement("div");
+    row.className = "row-end";
+    const cancel = document.createElement("button");
+    cancel.type = "button"; cancel.className = "btn ghost"; cancel.textContent = "Cancel";
+    const send = document.createElement("button");
+    send.type = "button"; send.className = "btn"; send.textContent = "Send"; send.disabled = true;
+    row.append(cancel, send);
+    modal.append(h2, slot, note, caption, bar, row);
+
+    const done = () => { if (previewUrl) URL.revokeObjectURL(previewUrl); close(); };
+    cancel.onclick = () => { if (upload) upload.abort(); done(); };
+    overlay.onclick = (e) => { if (e.target === overlay && !busy) done(); }; // don't lose an upload by a stray click
+
+    const go = async () => {
+      if (!prepared || busy) return;
+      busy = true; send.disabled = true; caption.disabled = true;
+      note.className = "photo-note"; note.textContent = "Sending…";
+      bar.classList.remove("hidden"); fill.style.width = "0";
+      upload = uploadImage(chat.id, prepared, caption.value.trim(), (f) => { fill.style.width = Math.round(f * 100) + "%"; });
+      try {
+        await upload.promise;
+        state.lastPing = 0;
+        done();
+        if (state.active === chat) poke();
+      } catch (err) {
+        busy = false; upload = null; send.disabled = false; caption.disabled = false;
+        bar.classList.add("hidden");
+        if (err.status === 401) { done(); handleAuthError(err); return; }
+        note.className = "photo-note err";
+        note.textContent = err.message;
+        send.textContent = "Try again";
+      }
+    };
+    send.onclick = go;
+    caption.onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); go(); } };
+
+    prepareImage(file).then((p) => {
+      if (!overlay.isConnected) return;
+      prepared = p;
+      previewUrl = URL.createObjectURL(p.thumb);
+      const im = new Image();
+      im.className = "photo-preview"; im.alt = "Preview"; im.src = previewUrl;
+      slot.appendChild(im);
+      const kb = Math.max(1, Math.round(p.full.size / 1024));
+      note.textContent = `${p.w} × ${p.h}, ${kb >= 1024 ? (kb / 1024).toFixed(1) + " MB" : kb + " KB"}`;
+      send.disabled = false;
+      caption.focus();
+    }).catch((err) => { note.className = "photo-note err"; note.textContent = err.message; });
+  });
+}
+
+$("attachBtn").onclick = () => $("fileInput").click();
+$("fileInput").onchange = (e) => { const f = e.target.files[0]; e.target.value = ""; if (f) pickImage(f); };
+$("text").addEventListener("paste", (e) => {
+  const f = [...(e.clipboardData?.files || [])].find((x) => x.type.startsWith("image/"));
+  if (f) { e.preventDefault(); pickImage(f); }
+});
+const hasFiles = (e) => e.dataTransfer && [...e.dataTransfer.types].includes("Files");
+const mainEl = document.querySelector("main");
+let dragDepth = 0;
+mainEl.addEventListener("dragenter", (e) => { if (hasFiles(e) && state.active) { dragDepth++; mainEl.classList.add("dropping"); } });
+mainEl.addEventListener("dragover", (e) => { if (hasFiles(e) && state.active) e.preventDefault(); });
+mainEl.addEventListener("dragleave", () => { if (--dragDepth <= 0) { dragDepth = 0; mainEl.classList.remove("dropping"); } });
+mainEl.addEventListener("drop", (e) => {
+  if (!hasFiles(e)) return;
+  e.preventDefault(); dragDepth = 0; mainEl.classList.remove("dropping");
+  const f = [...e.dataTransfer.files].find((x) => x.type.startsWith("image/"));
+  if (f && state.active) pickImage(f);
 });
 
 /* ---------- modals ---------- */
@@ -1190,6 +1451,9 @@ $("settingsBtn").onclick = () => openModal((modal, close) => {
   }
   modal.appendChild(walls);
 
+  const install = installSection(mk);
+  if (install) modal.appendChild(install);
+
   modal.appendChild(status);
   const row = mk("div", "row");
   const done = mk("button", "btn", "Done");
@@ -1200,7 +1464,41 @@ $("settingsBtn").onclick = () => openModal((modal, close) => {
   refreshAll();
 });
 
+/* ---------- installable app ---------- */
+const isStandalone = () => (window.matchMedia && matchMedia("(display-mode: standalone)").matches) || navigator.standalone === true;
+const isIOS = () => /iphone|ipad|ipod/i.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+let installPrompt = null; // Chrome/Edge/Android hand us this when the site can be installed
+window.addEventListener("beforeinstallprompt", (e) => { e.preventDefault(); installPrompt = e; });
+window.addEventListener("appinstalled", () => { installPrompt = null; });
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", () => navigator.serviceWorker.register("/sw.js").catch(() => {}));
+}
+// Settings calls this to add its "Install app" section (nothing is shown inside the installed app).
+function installSection(mk) {
+  if (isStandalone()) return null;
+  const wrap = mk("div");
+  wrap.appendChild(mk("h3", "", "App"));
+  if (installPrompt) {
+    const b = mk("button", "btn ghost", "Install app");
+    b.type = "button";
+    b.onclick = async () => {
+      const ev = installPrompt;
+      installPrompt = null;
+      b.disabled = true;
+      try { await ev.prompt(); await ev.userChoice; } catch {}
+      wrap.remove();
+    };
+    wrap.append(b, mk("p", "install-hint", "Opens in its own window, with an icon on your home screen or desktop."));
+  } else if (isIOS()) {
+    wrap.appendChild(mk("p", "install-hint", "To install: tap the Share button in Safari, then \u201cAdd to Home Screen\u201d."));
+  } else {
+    wrap.appendChild(mk("p", "install-hint", "To install, use your browser\u2019s menu: \u201cInstall app\u201d or \u201cAdd to Home screen\u201d."));
+  }
+  return wrap;
+}
+
 /* ---------- boot ---------- */
+syncThemeColor();
 (async () => {
   try {
     const { username, prefs } = await api("/me");
