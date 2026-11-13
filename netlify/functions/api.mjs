@@ -8,6 +8,7 @@ const chats = () => store("chats"); //  c/<chatId>
 const index = () => store("chat-index"); //  idx/<username>/<chatId>
 const msgs = () => store("messages"); //  msg/<chatId>/<ts>-<rand>
 const rl = () => store("ratelimit"); //  login/u/<hash>, login/ip/<hash>, signup/ip/<hash>
+const imgStore = () => store("images"); //  img/<chatId>/<imgId> (full size), thumb/<chatId>/<imgId>
 const typingStore = () => store("typing"); //  t/<chatId> -> { username: lastPingMs }
 const TYPING_TTL = 6000; // a typer is shown for this long after their last ping (clients ping every ~2.5s)
 
@@ -351,6 +352,9 @@ async function deleteMessage(me, id, suffix) {
   if (!msg.deleted) {
     // Erase the text for real; keep a tombstone so message order and keys stay stable.
     await msgs().setJSON(key, { from: msg.from, ts: msg.ts, deleted: true });
+    if (msg.image && IMG_ID_RE.test(msg.image.id)) {
+      await Promise.allSettled([imgStore().delete(`img/${id}/${msg.image.id}`), imgStore().delete(`thumb/${id}/${msg.image.id}`)]);
+    }
     // Marker that lets clients who already showed the message learn it was deleted.
     await msgs().setJSON(`del/${id}/${suffix}`, true);
     const { blobs } = await msgs().list({ prefix: `msg/${id}/` });
@@ -511,6 +515,11 @@ async function removeMember(me, id, target) {
     // Last person left: delete the group and its messages.
     await chats().delete(`c/${id}`);
     await typingStore().delete(`t/${id}`);
+    const pics = [
+      ...(await imgStore().list({ prefix: `img/${id}/` })).blobs,
+      ...(await imgStore().list({ prefix: `thumb/${id}/` })).blobs,
+    ].map((b) => b.key);
+    for (let i = 0; i < pics.length; i += 25) await Promise.all(pics.slice(i, i + 25).map((k) => imgStore().delete(k)));
     await index().delete(`idx/${target}/${id}`);
     const keys = [
       ...(await msgs().list({ prefix: `msg/${id}/` })).blobs,
@@ -527,6 +536,86 @@ async function removeMember(me, id, target) {
   await bumpVersion([target]); // so their client notices straight away
   await postSystem(chat, me, leaving ? `${me} left` : `${me} removed ${target}`);
   return json({ ok: true, chat });
+}
+
+// ---------- images ----------
+const IMG_MAX = 3 * 1024 * 1024; //   full-size picture (the browser shrinks photos to ~1600px first)
+const THUMB_MAX = 300 * 1024; //      preview shown in the conversation
+const IMG_LIMIT = 30; //              pictures per user per window
+const IMG_WINDOW = 10 * MIN;
+const IMG_ID_RE = /^[0-9a-f]{16}$/;
+
+// What the bytes ARE, decided by the server from the file's own header, never from what the client claims.
+// SVG (which can carry scripts) and anything else is refused.
+function sniffImage(buf) {
+  const b = new Uint8Array(buf.slice(0, 16));
+  if (b.length < 12) return null;
+  const at = (from, len) => String.fromCharCode(...b.subarray(from, from + len));
+  if (b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return "image/jpeg";
+  if (b[0] === 0x89 && at(1, 3) === "PNG" && b[4] === 0x0d && b[5] === 0x0a && b[6] === 0x1a && b[7] === 0x0a) return "image/png";
+  if (at(0, 6) === "GIF87a" || at(0, 6) === "GIF89a") return "image/gif";
+  if (at(0, 4) === "RIFF" && at(8, 4) === "WEBP") return "image/webp";
+  return null;
+}
+
+// One request = one message: the picture, its thumbnail and the message are created together,
+// so a failed upload can never leave half a message behind.
+async function sendImage(me, id, req) {
+  const chat = await loadChatFor(id, me);
+  if (!chat) return fail(404, "Chat not found.");
+  const wait = await lockedFor(`img/u/${me}`);
+  if (wait) return tooMany(wait);
+
+  let form;
+  try { form = await req.formData(); } catch { return fail(400, "Expected a photo upload."); }
+  const file = form.get("image"), thumb = form.get("thumb");
+  if (!(file instanceof Blob) || !(thumb instanceof Blob)) return fail(400, "Both the image and its thumbnail are required.");
+  if (file.size > IMG_MAX) return fail(413, "That image is too large (3 MB maximum).");
+  if (thumb.size > THUMB_MAX) return fail(413, "The thumbnail is too large.");
+
+  const fullBuf = await file.arrayBuffer(), thumbBuf = await thumb.arrayBuffer();
+  const type = sniffImage(fullBuf), thumbType = sniffImage(thumbBuf);
+  if (!type || !thumbType || thumbType === "image/gif") return fail(400, "That doesn't look like a JPEG, PNG, GIF or WebP image.");
+
+  const w = Number(form.get("w")), h = Number(form.get("h"));
+  if (![w, h].every((n) => Number.isInteger(n) && n >= 1 && n <= 10000)) return fail(400, "Bad image size.");
+  const text = String(form.get("text") || "").trim();
+  if (text.length > 500) return fail(400, "Caption too long (500 max).");
+
+  await recordHit(`img/u/${me}`, IMG_LIMIT, IMG_WINDOW, IMG_WINDOW); // counted once the upload is known to be valid
+
+  const imgId = rand(8);
+  const ts = Date.now();
+  const key = `msg/${id}/${String(ts).padStart(13, "0")}-${rand(3)}`;
+  await Promise.all([imgStore().set(`img/${id}/${imgId}`, fullBuf), imgStore().set(`thumb/${id}/${imgId}`, thumbBuf)]);
+  try {
+    await msgs().setJSON(key, { from: me, text, ts, image: { id: imgId, w, h, type } });
+  } catch (err) {
+    await Promise.allSettled([imgStore().delete(`img/${id}/${imgId}`), imgStore().delete(`thumb/${id}/${imgId}`)]);
+    throw err;
+  }
+  await clearTyping(me, id);
+  await touchIndex(chat, ts, `${me}: 📷 ${text ? text.slice(0, 50) : "Photo"}`, me);
+  return json({ ok: true, key });
+}
+
+// Pictures are only served to people in the chat, with headers that make the browser treat them strictly as images.
+async function serveImage(me, id, imgId, url) {
+  const chat = await loadChatFor(id, me);
+  if (!chat) return fail(404, "Not found.");
+  const kind = url.searchParams.get("size") === "full" ? "img" : "thumb";
+  const buf = await imgStore().get(`${kind}/${id}/${imgId}`, { type: "arrayBuffer" });
+  const type = buf && sniffImage(buf);
+  if (!type) return fail(404, "Not found.");
+  return new Response(buf, {
+    headers: {
+      "Content-Type": type,
+      "Cache-Control": "private, max-age=31536000, immutable", // the id never changes what it points to
+      "X-Content-Type-Options": "nosniff",
+      "Content-Security-Policy": "default-src 'none'; sandbox",
+      "Content-Disposition": "inline",
+    },
+  });
 }
 
 // ---------- entry ----------
@@ -555,6 +644,11 @@ export default async (req) => {
     const m = path.match(/^\/chats\/([\w-]+)\/messages$/);
     if (m && method === "GET") return await getMessages(me, m[1], url);
     if (m && method === "POST") return await sendMessage(me, m[1], req);
+
+    const im = path.match(/^\/chats\/([\w-]+)\/images$/);
+    if (im && method === "POST") return await sendImage(me, im[1], req);
+    const ig = path.match(/^\/chats\/([\w-]+)\/images\/([0-9a-f]{16})$/);
+    if (ig && method === "GET") return await serveImage(me, ig[1], ig[2], url);
 
     const ty = path.match(/^\/chats\/([\w-]+)\/typing$/);
     if (ty && method === "POST") return await setTyping(me, ty[1], req);
