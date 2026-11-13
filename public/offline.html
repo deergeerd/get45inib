@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Offline</title>
+<style>
+  :root { color-scheme: light dark; --bg: #f6f5f1; --ink: #1d1d1b; --muted: #75736b; --accent: #2f6f5e; --on: #fff; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #151614; --ink: #ecebe5; --muted: #8f8d84; --accent: #5aa892; --on: #10130f; } }
+  html, body { height: 100%; margin: 0; }
+  body { display: grid; place-items: center; padding: 24px; background: var(--bg); color: var(--ink); font: 16px/1.45 system-ui, -apple-system, Segoe UI, sans-serif; text-align: center; }
+  h1 { font-size: 20px; margin: 0 0 8px; }
+  p { margin: 0 0 18px; color: var(--muted); }
+  button { background: var(--accent); color: var(--on); border: 0; border-radius: 8px; padding: 10px 18px; font: inherit; font-weight: 600; cursor: pointer; }
+</style>
+</head>
+<body>
+  <main>
+    <h1>You're offline</h1>
+    <p>Chat needs a connection. It will reconnect automatically.</p>
+    <button type="button" id="retry">Try again</button>
+  </main>
+<script>
+  document.getElementById("retry").onclick = () => location.reload();
+  window.addEventListener("online", () => location.reload());
+</script>
+</body>
+</html>
